@@ -21,7 +21,7 @@ namespace MoonsecBot
         private DiscordSocketClient _client;
         private CommandService _commands;
         private IServiceProvider _services;
-        private static HttpClient _httpClient = new HttpClient();
+        private static readonly HttpClient _httpClient = new HttpClient();
 
         public static async Task Main(string[] args)
         {
@@ -54,6 +54,7 @@ namespace MoonsecBot
             if (string.IsNullOrEmpty(token))
                 throw new Exception("DISCORD_BOT_TOKEN missing");
 
+            // Ensure Medal is up before connecting to Discord
             await WaitForMedalService();
 
             await _client.LoginAsync(TokenType.Bot, token);
@@ -68,20 +69,20 @@ namespace MoonsecBot
             {
                 try
                 {
-                    var response = await _httpClient.GetAsync("http://localhost:8080/");
+                    // The Medal Rust service returns "yep web-server is on" at root
+                    var response = await _httpClient.GetAsync("http://127.0.0.1:8080/");
                     if (response.IsSuccessStatusCode)
                     {
                         Console.WriteLine("✅ Medal service is ready");
                         return;
                     }
                 }
-                catch { }
+                catch { /* Ignore connection errors during wait */ }
                 
-                await Task.Delay(1000);
                 Console.WriteLine($"⏳ Waiting for Medal service... ({i + 1}/{maxRetries})");
+                await Task.Delay(2000);
             }
-            
-            throw new Exception("Medal service failed to start");
+            throw new Exception("Medal service failed to start on port 8080");
         }
 
         private static async Task StartHealthCheckServer()
@@ -111,79 +112,76 @@ namespace MoonsecBot
             if (!userMessage.Content.StartsWith(".i", StringComparison.OrdinalIgnoreCase))
                 return;
 
-            if (!userMessage.Attachments.Any())
+            var attachment = userMessage.Attachments.FirstOrDefault(a => a.Filename.EndsWith(".lua"));
+            if (attachment == null)
             {
-                await userMessage.ReplyAsync("❌ Please attach a `.lua` file with the `.i` command.", allowedMentions: AllowedMentions.None);
-                return;
-            }
-
-            var attachment = userMessage.Attachments.First();
-            if (!attachment.Filename.EndsWith(".lua"))
-            {
-                await userMessage.ReplyAsync("❌ Only `.lua` files are allowed.", allowedMentions: AllowedMentions.None);
+                await userMessage.ReplyAsync("❌ Please attach a valid `.lua` file.");
                 return;
             }
 
             var dmChannel = await userMessage.Author.CreateDMChannelAsync();
-            var loadingMessage = await dmChannel.SendMessageAsync("📤 ⏳ **Processing your file...**");
+            var loadingMessage = await dmChannel.SendMessageAsync("📤 ⏳ **Processing...**");
 
             try
             {
                 var service = _services.GetRequiredService<DeobfuscationService>();
                 
+                // Download file
                 var bytes = await _httpClient.GetByteArrayAsync(attachment.Url);
                 var input = Encoding.UTF8.GetString(bytes);
 
-                await loadingMessage.ModifyAsync(msg => msg.Content = "📤 ⏳ **Deobfuscating with MoonSec...**");
+                // Step 1: Devirtualization (Uses NLua - needs the symlinks in Docker)
+                await loadingMessage.ModifyAsync(msg => msg.Content = "📤 ⏳ **Running Devirtualizer...**");
                 var deobfuscatedSource = service.DevirtualizeToSource(input);
                 
+                // Step 2: Decompilation (Calls Medal Rust Service)
                 await loadingMessage.ModifyAsync(msg => msg.Content = "📤 ⏳ **Decompiling with Medal...**");
                 var decompiled = await service.DecompileWithMedalAsync(deobfuscatedSource);
 
                 await loadingMessage.DeleteAsync();
                 
-                if (decompiled.Length > 2000)
+                if (decompiled.Length > 1900)
                 {
                     await using var stream = new MemoryStream(Encoding.UTF8.GetBytes(decompiled));
-                    await dmChannel.SendFileAsync(stream, "decompiled.lua", $"✅ Deobfuscation complete for `{attachment.Filename}`");
+                    await dmChannel.SendFileAsync(stream, "decompiled.lua", $"✅ Done: `{attachment.Filename}`");
                 }
                 else
                 {
-                    await dmChannel.SendMessageAsync($"✅ Deobfuscation complete for `{attachment.Filename}`:\n```lua\n{decompiled}\n```");
+                    await dmChannel.SendMessageAsync($"✅ Result for `{attachment.Filename}`:\n```lua\n{decompiled}\n```");
                 }
             }
             catch (Exception ex)
             {
-                await loadingMessage.ModifyAsync(msg => msg.Content = $"❌ Processing failed: `{ex.Message}`");
-                Console.WriteLine($"❌ Error: {ex}");
+                await loadingMessage.ModifyAsync(msg => msg.Content = $"❌ Error: `{ex.Message}`");
+                Console.WriteLine($"[ERROR] {ex}");
             }
         }
     }
 
     public class DeobfuscationService
     {
-        private static HttpClient _httpClient = new HttpClient();
+        private static readonly HttpClient _httpClient = new HttpClient();
         
         public string DevirtualizeToSource(string code)
         {
+            // This call relies on NLua/KeraLua finding 'liblua54.so'
             var result = new Deobfuscator().Deobfuscate(code);
             return result.ToString();
         }
 
         public async Task<string> DecompileWithMedalAsync(string luaSource)
         {
-            var sourceBytes = Encoding.UTF8.GetBytes(luaSource);
+            // IMPORTANT: Your Rust code uses 'body: Bytes'.
+            // We must send the raw string bytes, NOT a Multipart form.
+            using var content = new ByteArrayContent(Encoding.UTF8.GetBytes(luaSource));
             
-            using var content = new MultipartFormDataContent();
-            using var byteContent = new ByteArrayContent(sourceBytes);
-            content.Add(byteContent, "file", "input.lua");
-
-            var response = await _httpClient.PostAsync("http://localhost:8080/lua51/decompile", content);
+            // Ensure the Medal service is started with the --lua51 flag to enable this route
+            var response = await _httpClient.PostAsync("http://127.0.0.1:8080/lua51/decompile", content);
             
             if (!response.IsSuccessStatusCode)
             {
                 var error = await response.Content.ReadAsStringAsync();
-                throw new Exception($"Medal HTTP error: {response.StatusCode} - {error}");
+                throw new Exception($"Medal API Error ({response.StatusCode}): {error}");
             }
 
             return await response.Content.ReadAsStringAsync();
