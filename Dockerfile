@@ -1,36 +1,10 @@
-# STAGE 1: Build Medal from source
-FROM rust:alpine AS medal-builder
-WORKDIR /build
-
-# Install build dependencies
-RUN apk add --no-cache git build-base musl-dev && \
-    rustup toolchain install nightly && \
-    rustup default nightly
-
-# Copy all files
-COPY . .
-
-# Build with all warnings suppressed
-ENV RUSTFLAGS="-A warnings"
-RUN cargo build --release --bin medal && \
-    strip target/release/medal
-
-# STAGE 2: Build .NET Discord Bot
-FROM mcr.microsoft.com/dotnet/sdk:9.0-alpine AS bot-builder
-WORKDIR /build
-
-# Copy all files
-COPY . .
-
-# Publish .NET app
-RUN dotnet publish MoonsecDeobfuscator.csproj -c Release -o /app --verbosity quiet
-
 # STAGE 3: Runtime
 FROM mcr.microsoft.com/dotnet/aspnet:9.0-alpine
 WORKDIR /app
 
-# 1. Install NLua/Medal dependencies
-# We add libgcc and libstdc++ because the Rust binary and Lua need them on Alpine
+# 1. Install Alpine-specific native dependencies
+# We include libgcc and libstdc++ because native Lua and your Rust 'medal' binary
+# require these to function on Alpine's musl-based system.
 RUN apk add --no-cache \
     curl \
     ca-certificates \
@@ -39,19 +13,19 @@ RUN apk add --no-cache \
     libgcc \
     libstdc++
 
-# 2. FIX THE LUA ERROR: 
-# Alpine's 'lua5.4-libs' puts the file at /usr/lib/liblua.so.5.4
-# .NET looks for 'liblua54.so' or 'lua54.so'. We create symlinks for both.
+# 2. Map Alpine's library name to the name NLua expects
+# This creates a 'shortcut' so when .NET asks for 'liblua54.so', 
+# it points to the actual file Alpine installed.
 RUN ln -sf /usr/lib/liblua.so.5.4 /usr/lib/liblua54.so && \
-    ln -sf /usr/lib/liblua.so.5.4 /usr/lib/lua54.so && \
-    ln -sf /usr/lib/liblua.so.5.4 /app/liblua54.so
+    ln -sf /usr/lib/liblua.so.5.4 /app/liblua54.so && \
+    ln -sf /usr/lib/liblua.so.5.4 /usr/lib/lua54.so
 
 ENV DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=0
 
-# Copy bot files
+# Copy your published bot files
 COPY --from=bot-builder /app/ ./
 
-# Copy Medal binary from Stage 1
+# Copy and set permissions for the Medal binary
 COPY --from=medal-builder /build/target/release/medal ./medal
 RUN chmod +x ./medal
 
