@@ -18,7 +18,7 @@ namespace MoonsecBot
         public static async Task Main(string[] args)
         {
             DotNetEnv.Env.Load();
-            // Start Health Check on port 3000 for Render
+            // Start internal health check on 8080
             _ = StartHealthCheckServer();
             await new Program().RunAsync();
         }
@@ -45,13 +45,12 @@ namespace MoonsecBot
 
         private static async Task StartHealthCheckServer()
         {
-            var port = Environment.GetEnvironmentVariable("PORT") ?? "3000";
+            // Now explicitly using 8080 for the Bot
             var builder = WebApplication.CreateBuilder();
-            builder.WebHost.UseSetting("urls", $"http://0.0.0.0:{port}");
-            var app = builder.Build();
+            builder.WebHost.UseSetting("urls", "http://0.0.0.0:8080");
             
-            // Map to /bot to avoid collision with Medal's root
-            app.MapGet("/bot", () => "MoonSec Bot is running.");
+            var app = builder.Build();
+            app.MapGet("/bot", () => "Bot is alive on internal port 8080.");
             await app.RunAsync();
         }
 
@@ -63,45 +62,37 @@ namespace MoonsecBot
             var attachment = userMsg.Attachments.FirstOrDefault(a => a.Filename.EndsWith(".lua"));
             if (attachment == null) return;
 
-            // 1. Send initial reply
-            var statusMessage = await userMsg.ReplyAsync("⏳ **Processing your file...**", allowedMentions: AllowedMentions.None);
+            var statusMessage = await userMsg.ReplyAsync("⏳ **Processing...**");
 
-            // 2. Offload work to a background thread
             _ = Task.Run(async () =>
             {
                 try
                 {
                     var service = _services.GetRequiredService<DeobfuscationService>();
-                    
-                    // Step A: Download
                     var bytes = await _httpClient.GetByteArrayAsync(attachment.Url);
                     var input = Encoding.UTF8.GetString(bytes);
 
-                    // Step B: Devirtualize
-                    await statusMessage.ModifyAsync(m => m.Content = "🔍 **Step 1: Devirtualizing Lua...**");
+                    await statusMessage.ModifyAsync(m => m.Content = "🔍 **Devirtualizing...**");
                     var deobfuscated = service.DevirtualizeToSource(input);
                     
-                    // Step C: Decompile
-                    await statusMessage.ModifyAsync(m => m.Content = "🚀 **Step 2: Decompiling with Medal...**");
+                    await statusMessage.ModifyAsync(m => m.Content = "🚀 **Decompiling (Medal on 3000)...**");
                     var result = await service.DecompileWithMedalAsync(deobfuscated);
 
-                    // 3. Send final result
                     await statusMessage.DeleteAsync();
 
                     if (result.Length > 2000)
                     {
                         using var ms = new MemoryStream(Encoding.UTF8.GetBytes(result));
-                        await userMsg.Channel.SendFileAsync(ms, "decompiled.lua", $"✅ **Success:** `{attachment.Filename}`");
+                        await userMsg.Channel.SendFileAsync(ms, "result.lua", $"✅ Done: `{attachment.Filename}`");
                     }
                     else
                     {
-                        await userMsg.Channel.SendMessageAsync($"✅ **Success:** `{attachment.Filename}`\n```lua\n{result}\n```");
+                        await userMsg.Channel.SendMessageAsync($"✅ Done!\n```lua\n{result}\n```");
                     }
                 }
                 catch (Exception ex)
                 {
-                    await statusMessage.ModifyAsync(m => m.Content = $"❌ **Error:** `{ex.Message}`");
-                    Console.WriteLine($"[ERROR] {ex}");
+                    await statusMessage.ModifyAsync(m => m.Content = $"❌ Error: `{ex.Message}`");
                 }
             });
         }
@@ -111,22 +102,18 @@ namespace MoonsecBot
     {
         private static readonly HttpClient _httpClient = new HttpClient();
 
-        public string DevirtualizeToSource(string code) 
-        {
-            // This call uses NLua/KeraLua (requires liblua54.so symlink)
-            return new Deobfuscator().Deobfuscate(code).ToString();
-        }
+        public string DevirtualizeToSource(string code) => new Deobfuscator().Deobfuscate(code).ToString();
 
         public async Task<string> DecompileWithMedalAsync(string luaSource)
         {
-            // Send raw bytes to the Medal Rust service on port 8080
             using var content = new ByteArrayContent(Encoding.UTF8.GetBytes(luaSource));
-            var response = await _httpClient.PostAsync("http://127.0.0.1:8080/lua51/decompile", content);
+            // Now calling port 3000 where the Rust service is listening
+            var response = await _httpClient.PostAsync("http://127.0.0.1:3000/lua51/decompile", content);
             
             if (!response.IsSuccessStatusCode)
             {
                 var err = await response.Content.ReadAsStringAsync();
-                throw new Exception($"Medal API Error: {err}");
+                throw new Exception($"Medal Error: {err}");
             }
             return await response.Content.ReadAsStringAsync();
         }
