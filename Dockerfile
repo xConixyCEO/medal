@@ -1,10 +1,23 @@
-# STAGE 3: Runtime
+# STAGE 1: Must be named 'medal-builder'
+FROM rust:alpine AS medal-builder
+WORKDIR /build
+RUN apk add --no-cache git build-base musl-dev && \
+    rustup toolchain install nightly && \
+    rustup default nightly
+COPY . .
+RUN cargo build --release --bin medal && strip target/release/medal
+
+# STAGE 2: Must be named 'bot-builder'
+FROM mcr.microsoft.com/dotnet/sdk:9.0-alpine AS bot-builder
+WORKDIR /build
+COPY . .
+RUN dotnet publish MoonsecDeobfuscator.csproj -c Release -o /app --verbosity quiet
+
+# STAGE 3: Final Runtime
 FROM mcr.microsoft.com/dotnet/aspnet:9.0-alpine
 WORKDIR /app
 
-# 1. Install Alpine-specific native dependencies
-# We include libgcc and libstdc++ because native Lua and your Rust 'medal' binary
-# require these to function on Alpine's musl-based system.
+# Install native dependencies
 RUN apk add --no-cache \
     curl \
     ca-certificates \
@@ -13,24 +26,18 @@ RUN apk add --no-cache \
     libgcc \
     libstdc++
 
-# 2. Map Alpine's library name to the name NLua expects
-# This creates a 'shortcut' so when .NET asks for 'liblua54.so', 
-# it points to the actual file Alpine installed.
+# Fix the Lua symlinks so NLua can find the library
 RUN ln -sf /usr/lib/liblua.so.5.4 /usr/lib/liblua54.so && \
-    ln -sf /usr/lib/liblua.so.5.4 /app/liblua54.so && \
-    ln -sf /usr/lib/liblua.so.5.4 /usr/lib/lua54.so
+    ln -sf /usr/lib/liblua.so.5.4 /app/liblua54.so
 
 ENV DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=0
 
-# Copy your published bot files
+# These lines were failing because they couldn't find the stages above
 COPY --from=bot-builder /app/ ./
-
-# Copy and set permissions for the Medal binary
 COPY --from=medal-builder /build/target/release/medal ./medal
-RUN chmod +x ./medal
 
-# Create startup script
-RUN printf '#!/bin/sh\n./medal serve --port 8080 &\nsleep 3\ndotnet MoonsecDeobfuscator.dll\n' > start.sh && \
+RUN chmod +x ./medal && \
+    printf '#!/bin/sh\n./medal serve --port 8080 &\nsleep 3\ndotnet MoonsecDeobfuscator.dll\n' > start.sh && \
     chmod +x start.sh
 
 EXPOSE 3000
