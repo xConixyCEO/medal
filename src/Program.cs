@@ -11,6 +11,7 @@ using System.Threading.Tasks;
 using System;
 using System.IO;
 using System.Linq;
+using System.Threading;
 using MoonsecDeobfuscator.Deobfuscation;
 
 namespace MoonsecBot
@@ -87,8 +88,6 @@ namespace MoonsecBot
         {
             var portStr = Environment.GetEnvironmentVariable("PORT") ?? "3000";
             var builder = WebApplication.CreateBuilder();
-            
-            // FIXED for .NET 9.0
             builder.WebHost.UseSetting("urls", $"http://0.0.0.0:{portStr}");
             
             var app = builder.Build();
@@ -114,7 +113,7 @@ namespace MoonsecBot
 
             if (!userMessage.Attachments.Any())
             {
-                await userMessage.ReplyAsync("❌ Please attach a `.lua` file.", allowedMentions: AllowedMentions.None);
+                await userMessage.ReplyAsync("❌ Please attach a `.lua` file with the `.i` command.", allowedMentions: AllowedMentions.None);
                 return;
             }
 
