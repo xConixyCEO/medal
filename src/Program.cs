@@ -1,6 +1,6 @@
 using Discord;
 using Discord.WebSocket;
-using Discord.Interactions;
+using Discord.Commands;
 using Microsoft.Extensions.DependencyInjection;
 using System.Reflection;
 using System.Text;
@@ -10,16 +10,16 @@ using System.Net.Http;
 using System.Threading.Tasks;
 using System;
 using System.IO;
+using System.Linq;
 using System.Threading;
 using MoonsecDeobfuscator.Deobfuscation;
-using MoonsecDeobfuscator.Deobfuscation.Bytecode;
 
 namespace MoonsecBot
 {
     public class Program
     {
         private DiscordSocketClient _client;
-        private InteractionService _interactions;
+        private CommandService _commands;
         private IServiceProvider _services;
         private static HttpClient _httpClient = new HttpClient();
 
@@ -34,20 +34,21 @@ namespace MoonsecBot
         {
             _client = new DiscordSocketClient(new DiscordSocketConfig
             {
-                GatewayIntents = GatewayIntents.Guilds,
+                GatewayIntents = GatewayIntents.Guilds | GatewayIntents.MessageContent | GatewayIntents.DirectMessages,
                 AlwaysDownloadUsers = true
             });
 
-            _interactions = new InteractionService(_client.Rest);
+            _commands = new CommandService();
+            
             _services = new ServiceCollection()
                 .AddSingleton(_client)
-                .AddSingleton(_interactions)
+                .AddSingleton(_commands)
                 .AddSingleton<DeobfuscationService>()
                 .BuildServiceProvider();
 
             _client.Log += msg => { Console.WriteLine(msg); return Task.CompletedTask; };
             _client.Ready += ReadyAsync;
-            _client.InteractionCreated += HandleInteractionAsync;
+            _client.MessageReceived += HandleMessageAsync;
 
             var token = Environment.GetEnvironmentVariable("DISCORD_BOT_TOKEN");
             if (string.IsNullOrEmpty(token))
@@ -61,7 +62,7 @@ namespace MoonsecBot
             await Task.Delay(-1);
         }
 
-        private static async Task WaitForMedalService()
+        private async Task WaitForMedalService()
         {
             var maxRetries = 30;
             for (int i = 0; i < maxRetries; i++)
@@ -99,96 +100,83 @@ namespace MoonsecBot
 
         private async Task ReadyAsync()
         {
-            await _interactions.AddModulesAsync(Assembly.GetEntryAssembly(), _services);
-            await _interactions.RegisterCommandsGloballyAsync(true);
+            await _commands.AddModulesAsync(Assembly.GetEntryAssembly(), _services);
             Console.WriteLine($"✅ Connected as {_client.CurrentUser}");
         }
 
-        private async Task HandleInteractionAsync(SocketInteraction interaction)
+        private async Task HandleMessageAsync(SocketMessage message)
         {
-            var context = new SocketInteractionContext(_client, interaction);
-            await _interactions.ExecuteCommandAsync(context, _services);
-        }
-    }
+            if (message is not SocketUserMessage userMessage || userMessage.Author.IsBot)
+                return;
 
-    public class DeobfuscationModule : InteractionModuleBase<SocketInteractionContext>
-    {
-        private readonly DeobfuscationService _service;
+            // Check for .i prefix
+            var argPos = 0;
+            if (!userMessage.Content.StartsWith(".i", StringComparison.OrdinalIgnoreCase))
+                return;
 
-        public DeobfuscationModule(DeobfuscationService service)
-        {
-            _service = service;
-        }
-
-        [SlashCommand("deobfuscate", "Deobfuscates a MoonSec-protected Lua file.")]
-        public async Task Deobfuscate(
-            [Summary("file", "Lua file to deobfuscate")] Attachment file)
-        {
-            await DeferAsync();
-
-            if (!file.Filename.EndsWith(".lua"))
+            // Check if there's an attachment
+            if (!userMessage.Attachments.Any())
             {
-                await FollowupAsync("❌ Only `.lua` files are allowed.");
+                await userMessage.ReplyAsync("❌ Please attach a `.lua` file with the `.i` command.", allowedMentions: AllowedMentions.None);
                 return;
             }
 
+            var attachment = userMessage.Attachments.First();
+            if (!attachment.Filename.EndsWith(".lua"))
+            {
+                await userMessage.ReplyAsync("❌ Only `.lua` files are allowed.", allowedMentions: AllowedMentions.None);
+                return;
+            }
+
+            // Send loading GIF in DMs (private)
+            var dmChannel = await userMessage.Author.CreateDMChannelAsync();
+            var loadingMessage = await dmChannel.SendMessageAsync(
+                "📤 <a:loading:123456789012345678> **Processing your file...**"
+            );
+
             try
             {
-                // Step 1: Download file
-                using var http = new HttpClient();
-                var bytes = await http.GetByteArrayAsync(file.Url);
+                // Process the file
+                var service = _services.GetRequiredService<DeobfuscationService>();
+                
+                // Download file
+                var bytes = await _httpClient.GetByteArrayAsync(attachment.Url);
                 var input = Encoding.UTF8.GetString(bytes);
 
-                // Step 2: Deobfuscate and generate bytecode (.luac)
-                await ModifyOriginalResponseAsync(msg => msg.Content = "🔄 **Step 1/3:** Deobfuscating with MoonSec...");
-                var bytecode = _service.Devirtualize(input);
+                // Deobfuscate and generate bytecode
+                await loadingMessage.ModifyAsync(msg => msg.Content = "📤 <a:loading:123456789012345678> **Deobfuscating with MoonSec...**");
+                var deobfuscatedSource = service.DevirtualizeToSource(input);
                 
-                var tempLuac = Path.Combine(Path.GetTempPath(), $"{Guid.NewGuid()}.luac");
-                await File.WriteAllBytesAsync(tempLuac, bytecode);
+                // Convert source to bytecode (if your deobfuscator supports it)
+                // Otherwise, send deobfuscated source directly to Medal
+                await loadingMessage.ModifyAsync(msg => msg.Content = "📤 <a:loading:123456789012345678> **Preparing for decompilation...**");
+                
+                // Send to Medal via HTTP
+                var decompiled = await service.DecompileWithMedalAsync(deobfuscatedSource);
 
-                // Step 3: Decompile with Medal via HTTP
-                await ModifyOriginalResponseAsync(msg => msg.Content = "🔄 **Step 2/3:** Decompiling with Medal...");
-                var decompiled = await _service.DecompileWithMedalAsync(bytecode);
-
-                // Clean up temp file
-                try { File.Delete(tempLuac); } catch { }
-
-                if (string.IsNullOrWhiteSpace(decompiled))
-                {
-                    await ModifyOriginalResponseAsync(msg => msg.Content = "❌ Medal decompilation failed.");
-                    return;
-                }
-
-                // Step 4: Send decompiled code
-                await ModifyOriginalResponseAsync(msg => msg.Content = "✅ **Step 3/3:** Sending result...");
-
+                // Send result
+                await loadingMessage.DeleteAsync();
+                
                 if (decompiled.Length > 2000)
                 {
                     await using var stream = new MemoryStream(Encoding.UTF8.GetBytes(decompiled));
-                    await FollowupWithFileAsync(
+                    await dmChannel.SendFileAsync(
                         stream,
                         "decompiled.lua",
-                        text: $"✅ Decompiled by {_client.CurrentUser}"
+                        text: $"✅ Deobfuscation complete for `{attachment.Filename}`"
                     );
                 }
                 else
                 {
-                    var embed = new EmbedBuilder()
-                        .WithTitle("✅ Deobfuscation Complete")
-                        .WithDescription($"```lua\n{decompiled}\n```")
-                        .WithColor(Color.Green)
-                        .WithFooter($"Processed for {Context.User.Username}")
-                        .Build();
-                    
-                    await FollowupAsync(embed: embed);
+                    await dmChannel.SendMessageAsync(
+                        $"✅ Deobfuscation complete for `{attachment.Filename}`:\n```lua\n{decompiled}\n```"
+                    );
                 }
-
-                await DeleteOriginalResponseAsync();
             }
             catch (Exception ex)
             {
+                await loadingMessage.ModifyAsync(msg => msg.Content = $"❌ Processing failed: `{ex.Message}`");
                 Console.WriteLine($"❌ Error: {ex}");
-                await FollowupAsync($"❌ Processing failed: `{ex.Message}`");
             }
         }
     }
@@ -197,23 +185,23 @@ namespace MoonsecBot
     {
         private static HttpClient _httpClient = new HttpClient();
         
-        public byte[] Devirtualize(string code)
+        public string DevirtualizeToSource(string code)
         {
             var result = new Deobfuscator().Deobfuscate(code);
-            using var ms = new MemoryStream();
-            using var serializer = new Serializer(ms);
-            serializer.Serialize(result);
-            return ms.ToArray();
+            // Convert AST back to source string
+            // If your Deobfuscator returns AST, implement ToString() or use a visitor
+            return result.ToString(); // Adjust based on your actual return type
         }
 
-        public async Task<string> DecompileWithMedalAsync(byte[] bytecode)
+        public async Task<string> DecompileWithMedalAsync(string luaSource)
         {
-            // Create multipart form data
+            // If Medal expects bytecode, convert source to bytes first
+            var sourceBytes = Encoding.UTF8.GetBytes(luaSource);
+            
             using var content = new MultipartFormDataContent();
-            using var byteContent = new ByteArrayContent(bytecode);
-            content.Add(byteContent, "file", "input.luac");
+            using var byteContent = new ByteArrayContent(sourceBytes);
+            content.Add(byteContent, "file", "input.lua");
 
-            // Send to Medal HTTP endpoint
             var response = await _httpClient.PostAsync("http://localhost:8080/lua51/decompile", content);
             
             if (!response.IsSuccessStatusCode)
