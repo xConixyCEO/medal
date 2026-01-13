@@ -6,43 +6,89 @@ using System.Reflection;
 using System.Text;
 using System.Net;
 using Microsoft.AspNetCore.Builder;
-using System;
-using System.Diagnostics;
-using System.IO;
-using System.Linq;
 using System.Net.Http;
 using System.Threading.Tasks;
-using System.Collections.Generic;
+using System;
+using System.IO;
 using System.Threading;
 using MoonsecDeobfuscator.Deobfuscation;
-using MoonsecDeobfuscator.Bytecode.Models;
+using MoonsecDeobfuscator.Deobfuscation.Bytecode;
 
-namespace GalacticBytecodeBot
+namespace MoonsecBot
 {
     public class Program
     {
-        private DiscordSocketClient _client = null!;
-        private InteractionService _interactions = null!;
-        private IServiceProvider _services = null!;
+        private DiscordSocketClient _client;
+        private InteractionService _interactions;
+        private IServiceProvider _services;
+        private static HttpClient _httpClient = new HttpClient();
 
         public static async Task Main(string[] args)
         {
-            // Load environment variables
-            try { DotNetEnv.Env.Load(); } catch { Console.WriteLine("No .env file found, using environment variables."); }
-            
-            // Start health check server for Render
+            DotNetEnv.Env.Load();
             _ = StartHealthCheckServer();
-
             await new Program().RunAsync();
+        }
+
+        public async Task RunAsync()
+        {
+            _client = new DiscordSocketClient(new DiscordSocketConfig
+            {
+                GatewayIntents = GatewayIntents.Guilds,
+                AlwaysDownloadUsers = true
+            });
+
+            _interactions = new InteractionService(_client.Rest);
+            _services = new ServiceCollection()
+                .AddSingleton(_client)
+                .AddSingleton(_interactions)
+                .AddSingleton<DeobfuscationService>()
+                .BuildServiceProvider();
+
+            _client.Log += msg => { Console.WriteLine(msg); return Task.CompletedTask; };
+            _client.Ready += ReadyAsync;
+            _client.InteractionCreated += HandleInteractionAsync;
+
+            var token = Environment.GetEnvironmentVariable("DISCORD_BOT_TOKEN");
+            if (string.IsNullOrEmpty(token))
+                throw new Exception("DISCORD_BOT_TOKEN missing");
+
+            // Wait for Medal service to be ready
+            await WaitForMedalService();
+
+            await _client.LoginAsync(TokenType.Bot, token);
+            await _client.StartAsync();
+            await Task.Delay(-1);
+        }
+
+        private static async Task WaitForMedalService()
+        {
+            var maxRetries = 30;
+            for (int i = 0; i < maxRetries; i++)
+            {
+                try
+                {
+                    var response = await _httpClient.GetAsync("http://localhost:8080/");
+                    if (response.IsSuccessStatusCode)
+                    {
+                        Console.WriteLine("✅ Medal service is ready");
+                        return;
+                    }
+                }
+                catch { /* Medal not ready yet */ }
+                
+                await Task.Delay(1000);
+                Console.WriteLine($"⏳ Waiting for Medal service... ({i + 1}/{maxRetries})");
+            }
+            
+            throw new Exception("Medal service failed to start");
         }
 
         private static async Task StartHealthCheckServer()
         {
             var portStr = Environment.GetEnvironmentVariable("PORT") ?? "3000";
             var builder = WebApplication.CreateBuilder();
-            
-            // FIXED: Use UseSetting instead of UseUrls for .NET 9.0
-            builder.WebHost.UseSetting("urls", $"http://0.0.0.0:{portStr}");
+            builder.WebHost.ConfigureKestrel(options => options.Listen(IPAddress.Any, int.Parse(portStr)));
             
             var app = builder.Build();
             app.MapGet("/", () => "MoonSec Bot is running.");
@@ -51,49 +97,11 @@ namespace GalacticBytecodeBot
             await app.RunAsync();
         }
 
-        public async Task RunAsync()
-        {
-            _client = new DiscordSocketClient(new DiscordSocketConfig
-            {
-                GatewayIntents = GatewayIntents.Guilds | GatewayIntents.DirectMessages,
-                AlwaysDownloadUsers = true
-            });
-
-            _interactions = new InteractionService(_client.Rest);
-
-            _services = new ServiceCollection()
-                .AddSingleton(_client)
-                .AddSingleton(_interactions)
-                .AddSingleton<DeobfuscationService>()
-                .BuildServiceProvider();
-
-            _client.Log += msg => { Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] {msg}"); return Task.CompletedTask; };
-            _client.Ready += ReadyAsync;
-            _client.InteractionCreated += HandleInteractionAsync;
-
-            var token = Environment.GetEnvironmentVariable("DISCORD_TOKEN");
-            if (string.IsNullOrEmpty(token))
-                throw new Exception("DISCORD_TOKEN missing in environment variables");
-
-            await _client.LoginAsync(TokenType.Bot, token);
-            await _client.StartAsync();
-
-            await Task.Delay(-1);
-        }
-
         private async Task ReadyAsync()
         {
             await _interactions.AddModulesAsync(Assembly.GetEntryAssembly(), _services);
             await _interactions.RegisterCommandsGloballyAsync(true);
-
-            await _client.SetStatusAsync(UserStatus.Online);
-            await _client.SetActivityAsync(new Game("🌙 MoonSec → Medal Pipeline"));
-            Console.WriteLine($"✅ Bot connected as {_client.CurrentUser}");
-            
-            if (!File.Exists("/app/medal"))
-                Console.WriteLine("⚠️ WARNING: Medal not found at /app/medal");
-            else
-                Console.WriteLine("✅ Medal found at /app/medal");
+            Console.WriteLine($"✅ Connected as {_client.CurrentUser}");
         }
 
         private async Task HandleInteractionAsync(SocketInteraction interaction)
@@ -112,65 +120,67 @@ namespace GalacticBytecodeBot
             _service = service;
         }
 
-        [SlashCommand("deobfuscate", "Deobfuscates a MoonSec-protected Lua file")]
-        public async Task DeobfuscateCommand(
-            [Summary("file", "Lua or text file")] IAttachment file)
+        [SlashCommand("deobfuscate", "Deobfuscates a MoonSec-protected Lua file.")]
+        public async Task Deobfuscate(
+            [Summary("file", "Lua file to deobfuscate")] Attachment file)
         {
             await DeferAsync();
 
-            if (!file.Filename.EndsWith(".lua") && !file.Filename.EndsWith(".txt") && 
-                !file.Filename.EndsWith(".luau"))
+            if (!file.Filename.EndsWith(".lua"))
             {
-                await FollowupAsync("❌ Only `.lua`, `.luau` or `.txt` files are allowed.");
+                await FollowupAsync("❌ Only `.lua` files are allowed.");
                 return;
             }
 
             try
             {
+                // Step 1: Download file
                 using var http = new HttpClient();
                 var bytes = await http.GetByteArrayAsync(file.Url);
-                var sourceCode = Encoding.UTF8.GetString(bytes);
+                var input = Encoding.UTF8.GetString(bytes);
 
-                // Step 1: Deobfuscate and create bytecode
-                await FollowupAsync("🔄 **Step 1/3:** Deobfuscating with MoonSec...");
-                var bytecode = _service.GenerateBytecode(sourceCode);
+                // Step 2: Deobfuscate and generate bytecode (.luac)
+                await ModifyOriginalResponseAsync(msg => msg.Content = "🔄 **Step 1/3:** Deobfuscating with MoonSec...");
+                var bytecode = _service.Devirtualize(input);
                 
-                var tempBytecode = Path.Combine(Path.GetTempPath(), $"{Guid.NewGuid()}.luac");
-                await File.WriteAllBytesAsync(tempBytecode, bytecode);
+                var tempLuac = Path.Combine(Path.GetTempPath(), $"{Guid.NewGuid()}.luac");
+                await File.WriteAllBytesAsync(tempLuac, bytecode);
 
-                // Step 2: Decompile with Medal
+                // Step 3: Decompile with Medal via HTTP
                 await ModifyOriginalResponseAsync(msg => msg.Content = "🔄 **Step 2/3:** Decompiling with Medal...");
-                var decompiled = await _service.DecompileWithMedal(tempBytecode);
+                var decompiled = await _service.DecompileWithMedalAsync(bytecode);
 
-                try { File.Delete(tempBytecode); } catch { }
+                // Clean up temp file
+                try { File.Delete(tempLuac); } catch { }
 
                 if (string.IsNullOrWhiteSpace(decompiled))
                 {
-                    await ModifyOriginalResponseAsync(msg => msg.Content = "❌ Medal failed to decompile.");
+                    await ModifyOriginalResponseAsync(msg => msg.Content = "❌ Medal decompilation failed.");
                     return;
                 }
 
-                // Step 3: Send result - FIXED: Build after setting description
+                // Step 4: Send decompiled code
                 await ModifyOriginalResponseAsync(msg => msg.Content = "✅ **Step 3/3:** Sending result...");
-
-                var embedBuilder = new EmbedBuilder()
-                    .WithTitle("✅ Deobfuscation Complete")
-                    .WithColor(Color.Green)
-                    .WithFooter($"Processed by {Context.User.Username}");
 
                 if (decompiled.Length > 2000)
                 {
-                    // Send as file
                     await using var stream = new MemoryStream(Encoding.UTF8.GetBytes(decompiled));
-                    await FollowupWithFileAsync(stream, "decompiled.lua", 
-                        text: $"{Context.User.Mention} here is your decompiled code:", 
-                        embed: embedBuilder.Build());
+                    await FollowupWithFileAsync(
+                        stream,
+                        "decompiled.lua",
+                        text: $"✅ Decompiled by {_client.CurrentUser}"
+                    );
                 }
                 else
                 {
-                    // Send in embed
-                    embedBuilder.WithDescription($"```lua\n{decompiled}\n```");
-                    await FollowupAsync($"{Context.User.Mention}", embed: embedBuilder.Build());
+                    var embed = new EmbedBuilder()
+                        .WithTitle("✅ Deobfuscation Complete")
+                        .WithDescription($"```lua\n{decompiled}\n```")
+                        .WithColor(Color.Green)
+                        .WithFooter($"Processed for {Context.User.Username}")
+                        .Build();
+                    
+                    await FollowupAsync(embed: embed);
                 }
 
                 await DeleteOriginalResponseAsync();
@@ -185,50 +195,34 @@ namespace GalacticBytecodeBot
 
     public class DeobfuscationService
     {
-        public byte[] GenerateBytecode(string sourceCode)
+        private static HttpClient _httpClient = new HttpClient();
+        
+        public byte[] Devirtualize(string code)
         {
-            var deob = new Deobfuscator();
-            var result = deob.Deobfuscate(sourceCode);
-            
+            var result = new Deobfuscator().Deobfuscate(code);
             using var ms = new MemoryStream();
-            var serializer = new MoonsecDeobfuscator.Deobfuscation.Bytecode.Serializer(ms);
+            using var serializer = new Serializer(ms);
             serializer.Serialize(result);
             return ms.ToArray();
         }
 
-        public async Task<string> DecompileWithMedal(string bytecodePath)
+        public async Task<string> DecompileWithMedalAsync(byte[] bytecode)
         {
-            var cts = new CancellationTokenSource(TimeSpan.FromMinutes(3));
-            var process = new Process
-            {
-                StartInfo = new ProcessStartInfo
-                {
-                    FileName = "/app/medal",
-                    Arguments = $"\"{bytecodePath}\"",
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    UseShellExecute = false,
-                    CreateNoWindow = true
-                }
-            };
+            // Create multipart form data
+            using var content = new MultipartFormDataContent();
+            using var byteContent = new ByteArrayContent(bytecode);
+            content.Add(byteContent, "file", "input.luac");
 
-            process.Start();
-            var output = await process.StandardOutput.ReadToEndAsync();
-            var error = await process.StandardError.ReadToEndAsync();
+            // Send to Medal HTTP endpoint
+            var response = await _httpClient.PostAsync("http://localhost:8080/lua51/decompile", content);
             
-            var exitTask = process.WaitForExitAsync();
-            var timeoutTask = Task.Delay(TimeSpan.FromMinutes(3), cts.Token);
-            
-            if (await Task.WhenAny(exitTask, timeoutTask) == timeoutTask)
+            if (!response.IsSuccessStatusCode)
             {
-                process.Kill();
-                throw new TimeoutException("Medal timed out after 3 minutes");
+                var error = await response.Content.ReadAsStringAsync();
+                throw new Exception($"Medal HTTP error: {response.StatusCode} - {error}");
             }
 
-            if (process.ExitCode != 0)
-                throw new Exception($"Medal failed: {error}");
-
-            return output;
+            return await response.Content.ReadAsStringAsync();
         }
     }
 }
