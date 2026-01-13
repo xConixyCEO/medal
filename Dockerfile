@@ -10,7 +10,7 @@ RUN apk add --no-cache git build-base && \
 COPY src/ ./src/
 COPY Cargo.toml ./
 
-# Build and strip binary
+# Build and strip binary for smaller size
 RUN cargo +nightly build --release --bin medal && \
     strip target/release/medal
 
@@ -18,12 +18,10 @@ RUN cargo +nightly build --release --bin medal && \
 FROM mcr.microsoft.com/dotnet/sdk:9.0-alpine AS bot-builder
 WORKDIR /build
 
-# Copy bot project files
-COPY bot/ ./bot/
+# Copy bot project files (root level)
 COPY MoonsecDeobfuscator.csproj ./
 COPY Program.cs ./
 COPY Deobfuscation/ ./Deobfuscation/
-COPY Bytecode/ ./Bytecode/
 
 # Restore and publish
 RUN dotnet restore MoonsecDeobfuscator.csproj && \
@@ -33,24 +31,23 @@ RUN dotnet restore MoonsecDeobfuscator.csproj && \
 FROM mcr.microsoft.com/dotnet/aspnet:9.0-alpine
 WORKDIR /app
 
-# Install dependencies for Medal
-RUN apk add --no-cache curl lua5.4 lua5.4-dev icu-libs && \
-    ln -sf /usr/lib/liblua5.4.so /usr/lib/liblua54.so
+# Install runtime dependencies
+RUN apk add --no-cache curl ca-certificates
 
-# Enable globalization support
-ENV DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=0
+# Copy bot files
+COPY --from=bot-builder /app/* ./
 
 # Copy Medal binary
 COPY --from=medal-builder /build/target/release/medal ./medal
 RUN chmod +x ./medal
 
-# Copy bot files
-COPY --from=bot-builder /app/* ./
+# Create startup script to run both services
+RUN echo '#!/bin/sh' > start.sh && \
+    echo './medal serve --port 8080 &' >> start.sh && \
+    echo 'sleep 3' >> start.sh && \
+    echo 'dotnet MoonsecDeobfuscator.dll' >> start.sh && \
+    chmod +x start.sh
 
-# Verify Medal exists
-RUN if [ ! -f ./medal ]; then echo "ERROR: Medal binary not found"; exit 1; fi
-
-# Expose health check port
 EXPOSE 3000
 
-CMD ["dotnet", "MoonsecDeobfuscator.dll"]
+CMD ["./start.sh"]
