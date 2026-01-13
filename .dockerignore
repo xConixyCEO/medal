@@ -1,0 +1,46 @@
+# Rust build artifacts
+target/
+Cargo.lock
+
+# .NET build artifacts
+bin/
+obj/
+publish/
+
+# Git files
+.git/
+.gitignore
+
+# Environment files
+.env
+.env.*
+
+# Docker files (not needed inside the image)
+Dockerfile
+.dockerignore
+render.yaml
+
+# Documentation (not needed in production image)
+*.md
+*.txt
+README*
+LICENSE*
+CONTRIBUTING*
+CHANGELOG*
+NOTICE*
+
+# IDE/editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs and temporary files
+*.log
+*.tmp
+
