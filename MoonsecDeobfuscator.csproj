@@ -4,10 +4,10 @@
     <OutputType>Exe</OutputType>
     <TargetFramework>net9.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
-    <!-- DISABLED: Set to disable to avoid legacy code warnings -->
+    <!-- DISABLED to avoid legacy code warnings -->
     <Nullable>disable</Nullable>
-    <!-- Suppress all warnings that cause build failures -->
-    <NoWarn>$(NoWarn);8600;8618;8625;8632;3021;1998;SYSLIB0014;CS8600;CS8618;CS8625;CS8632</NoWarn>
+    <!-- Suppress ALL warnings that cause build failures -->
+    <NoWarn>$(NoWarn);8600;8618;8625;8632;3021;1998;SYSLIB0014;CS8600;CS8618;CS8625;CS8632;0219</NoWarn>
     <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
   </PropertyGroup>
 
