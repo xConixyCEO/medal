@@ -1,15 +1,41 @@
+# STAGE 1: Build Medal from source
+FROM rust:alpine AS medal-builder
+WORKDIR /build
+
+# Install build dependencies
+RUN apk add --no-cache git build-base && \
+    rustup install nightly
+
+# Copy all files
+COPY . .
+
+# Build with all warnings suppressed
+ENV RUSTFLAGS="-A warnings"
+RUN cargo +nightly build --release --bin medal && \
+    strip target/release/medal
+
+# STAGE 2: Build .NET Discord Bot
+FROM mcr.microsoft.com/dotnet/sdk:9.0-alpine AS bot-builder
+WORKDIR /build
+
+# Copy all files
+COPY . .
+
+# The .csproj is in repository root
+WORKDIR /build
+
+# Publish .NET app
+RUN dotnet publish MoonsecDeobfuscator.csproj -c Release -o /app --verbosity quiet
+
 # STAGE 3: Runtime
 FROM mcr.microsoft.com/dotnet/aspnet:9.0-alpine
 WORKDIR /app
 
-# Install dependencies for NLua
-RUN apk add --no-cache curl ca-certificates lua5.4 lua5.4-dev icu-libs
-
-# Create symlink in a location NLua actually checks
-RUN ln -sf /usr/lib/liblua5.4.so /app/liblua54.so && \
+# Install NLua dependencies
+RUN apk add --no-cache curl ca-certificates lua5.4 lua5.4-dev icu-libs && \
+    ln -sf /usr/lib/liblua5.4.so /app/liblua54.so && \
     ln -sf /usr/lib/liblua5.4.so /app/lua54.so
 
-# Enable globalization support
 ENV DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=0
 
 # Copy bot files
