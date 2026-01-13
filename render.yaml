@@ -8,8 +8,4 @@ services:
         sync: false
       - key: PORT
         value: 3000
-      - key: ASPNETCORE_URLS
-        value: http://+:3000
     healthCheckPath: /
-    plan: starter
-    numInstances: 1
