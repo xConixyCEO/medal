@@ -1,9 +1,15 @@
 services:
   - type: web
-    name: medal-decompiler
+    name: moonsec-deobfuscator-bot
     env: docker
     dockerfilePath: ./Dockerfile
     plan: free
+    branch: main
     autoDeploy: true
-    # Render automatically sets $PORT, but we hardcode 3000 in Dockerfile
-
+    dockerBuildTimeoutSeconds: 1800
+    healthCheckPath: /
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: DOTNET_SYSTEM_GLOBALIZATION_INVARIANT
+        value: "1"
