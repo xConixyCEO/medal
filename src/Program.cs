@@ -1,10 +1,11 @@
 using Discord;
 using Discord.WebSocket;
-using Discord.Commands;
+using Discord.Interactions;
 using Microsoft.Extensions.DependencyInjection;
 using System.Reflection;
 using System.Text;
-using System.Diagnostics;
+using System.Net;
+using Microsoft.AspNetCore.Builder;
 using MoonsecDeobfuscator.Deobfuscation;
 using MoonsecDeobfuscator.Deobfuscation.Bytecode;
 
@@ -13,35 +14,37 @@ namespace MoonsecBot
     public class Program
     {
         private DiscordSocketClient _client;
-        private CommandService _commands;
+        private InteractionService _interactions;
         private IServiceProvider _services;
 
-        public static async Task Main(string[] args) => await new Program().RunAsync();
+        public static async Task Main(string[] args)
+        {
+            DotNetEnv.Env.Load();
+            _ = StartHealthCheckServer();
+            await new Program().RunAsync();
+        }
 
         public async Task RunAsync()
         {
-            // Intent setup: Required to read the ".d" text from messages
-            var config = new DiscordSocketConfig
+            _client = new DiscordSocketClient(new DiscordSocketConfig
             {
-                GatewayIntents = GatewayIntents.AllUnprivileged | GatewayIntents.MessageContent,
-                AlwaysDownloadUsers = true
-            };
+                // Added MessageContent intent if you plan to use prefixes later, 
+                // but keep it standard for Slash Commands.
+                GatewayIntents = GatewayIntents.Guilds | GatewayIntents.GuildMessages
+            });
 
-            _client = new DiscordSocketClient(config);
-            _commands = new CommandService();
+            _interactions = new InteractionService(_client.Rest);
 
             _services = new ServiceCollection()
                 .AddSingleton(_client)
-                .AddSingleton(_commands)
+                .AddSingleton(_interactions)
                 .AddSingleton<DeobfuscationService>()
                 .BuildServiceProvider();
 
-            _client.Log += (msg) => { Console.WriteLine(msg); return Task.CompletedTask; };
-            _client.MessageReceived += HandleCommandAsync;
+            _client.Log += msg => { Console.WriteLine(msg); return Task.CompletedTask; };
+            _client.Ready += ReadyAsync;
+            _client.InteractionCreated += HandleInteractionAsync;
 
-            await _commands.AddModulesAsync(Assembly.GetEntryAssembly(), _services);
-
-            // Fetch your token from Render Environment Variables
             var token = Environment.GetEnvironmentVariable("DISCORD_BOT_TOKEN");
             await _client.LoginAsync(TokenType.Bot, token);
             await _client.StartAsync();
@@ -49,92 +52,105 @@ namespace MoonsecBot
             await Task.Delay(-1);
         }
 
-        private async Task HandleCommandAsync(SocketMessage arg)
+        private static async Task StartHealthCheckServer()
         {
-            if (arg is not SocketUserMessage message || message.Author.IsBot) return;
+            var portStr = Environment.GetEnvironmentVariable("PORT") ?? "8080";
+            var builder = WebApplication.CreateBuilder();
+            builder.WebHost.UseSetting("urls", $"http://0.0.0.0:{portStr}");
+            
+            var app = builder.Build();
+            app.MapGet("/bot", () => "Active"); // Keep Render alive
+            await app.RunAsync();
+        }
 
-            int argPos = 0;
-            // Triggers on .d or .D
-            if (message.HasStringPrefix(".d", ref argPos, StringComparison.OrdinalIgnoreCase))
-            {
-                var context = new SocketCommandContext(_client, message);
-                await _commands.ExecuteAsync(context, argPos, _services);
-            }
+        private async Task ReadyAsync()
+        {
+            await _interactions.AddModulesAsync(Assembly.GetEntryAssembly(), _services);
+            await _interactions.RegisterCommandsGloballyAsync(true);
+        }
+
+        private async Task HandleInteractionAsync(SocketInteraction interaction)
+        {
+            var context = new SocketInteractionContext(_client, interaction);
+            await _interactions.ExecuteCommandAsync(context, _services);
         }
     }
 
-    public class DeobfuscationModule : ModuleBase<SocketCommandContext>
+    public class DeobfuscationModule : InteractionModuleBase<SocketInteractionContext>
     {
         private readonly DeobfuscationService _service;
+
         public DeobfuscationModule(DeobfuscationService service) => _service = service;
 
-        [Command("d")]
-        public async Task Deobfuscate()
+        [SlashCommand("deobfuscate", "Upload .lua/.txt to decompile via MoonSec Pipeline")]
+        public async Task Deobfuscate([Summary("file", "The obfuscated .lua or .txt file")] Attachment file)
         {
-            var attachment = Context.Message.Attachments.FirstOrDefault();
-            if (attachment == null) return;
+            await DeferAsync();
 
-            var sw = Stopwatch.StartNew();
-            var statusMessage = await ReplyAsync("processing..");
+            // Accept only .lua and .txt files
+            string ext = Path.GetExtension(file.Filename).ToLower();
+            if (ext != ".lua" && ext != ".txt")
+            {
+                await FollowupAsync("❌ Invalid file type. Please upload a `.lua` or `.txt` file.");
+                return;
+            }
 
             try
             {
                 using var http = new HttpClient();
-                var rawData = await http.GetByteArrayAsync(attachment.Url);
-                var scriptSource = Encoding.UTF8.GetString(rawData);
+                var bytes = await http.GetByteArrayAsync(file.Url);
+                var sourceCode = Encoding.UTF8.GetString(bytes);
 
-                // Start Pipeline: Obfuscated -> Bytecode -> Medal Public URL
-                var recoveredSource = await _service.ExecutePipelineAsync(scriptSource);
-                sw.Stop();
+                // 1. Process to .bin (Devirtualize)
+                // 2. Send to API and get string result
+                var decompiledResult = await _service.GetDecompiledSourceAsync(sourceCode);
 
-                // Generate random 12-char hex filename (e.g. 7f3e1a2b5c6d.lua)
+                // 3. Generate random hex filename
                 string hexName = Guid.NewGuid().ToString("N").Substring(0, 12) + ".lua";
 
-                // Delete 'processing..' and send final file
-                await statusMessage.DeleteAsync();
-
-                using var ms = new MemoryStream(Encoding.UTF8.GetBytes(recoveredSource));
-                await Context.Channel.SendFileAsync(ms, hexName, 
-                    $"Finished processing in {sw.ElapsedMilliseconds}ms\n" +
-                    "The bot has successfully recovered the file:");
+                using var ms = new MemoryStream(Encoding.UTF8.GetBytes(decompiledResult));
+                await Context.Channel.SendFileAsync(ms, hexName, "✅ **Decompilation Successful:**");
+                await DeleteOriginalResponseAsync();
             }
             catch (Exception ex)
             {
-                // If the URL fails, it will show the error here
-                await statusMessage.ModifyAsync(m => m.Content = $"❌ Error: `{ex.Message}`");
+                await FollowupAsync($"❌ Error: `{ex.Message}`");
             }
         }
     }
 
     public class DeobfuscationService
     {
-        private static readonly HttpClient _medalClient = new HttpClient();
-        // Updated to use your public Render URL
-        private const string MedalUrl = "https://medal-1.onrender.com/lua51/decompile";
+        private static readonly HttpClient _apiClient = new HttpClient();
+        // Replace with your actual Render API URL
+        private const string ApiUrl = "https://medal-1.onrender.com/lua51/decompile";
 
-        public async Task<string> ExecutePipelineAsync(string source)
+        public async Task<string> GetDecompiledSourceAsync(string code)
         {
-            // 1. Devirtualize
+            // Step 1: Devirtualize into bytecode (.bin format)
             var deobfuscator = new Deobfuscator();
-            var chunk = deobfuscator.Deobfuscate(source);
+            var result = deobfuscator.Deobfuscate(code);
             
-            // 2. Serialize to Bytecode
-            using var ms = new MemoryStream();
-            using (var serializer = new Serializer(ms))
+            byte[] bytecode;
+            using (var ms = new MemoryStream())
             {
-                serializer.Serialize(chunk);
+                using (var serializer = new Serializer(ms))
+                {
+                    serializer.Serialize(result);
+                }
+                bytecode = ms.ToArray();
             }
 
-            // 3. POST to Public URL
-            using var content = new ByteArrayContent(ms.ToArray());
-            var response = await _medalClient.PostAsync(MedalUrl, content);
+            // Step 2: Send .bin data to the API via POST
+            using var content = new ByteArrayContent(bytecode);
+            var response = await _apiClient.PostAsync(ApiUrl, content);
 
             if (!response.IsSuccessStatusCode)
             {
-                var errorInfo = await response.Content.ReadAsStringAsync();
-                throw new Exception($"Medal API error: {response.StatusCode} - {errorInfo}");
+                throw new Exception($"API returned {response.StatusCode}");
             }
 
+            // Return the decompiled string
             return await response.Content.ReadAsStringAsync();
         }
     }
