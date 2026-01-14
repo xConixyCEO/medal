@@ -20,7 +20,6 @@ namespace MoonsecBot
         public static async Task Main(string[] args)
         {
             DotNetEnv.Env.Load();
-            // Start Health Check Server on 8080 for Render
             _ = StartHealthCheckServer();
             await new Program().RunAsync();
         }
@@ -29,8 +28,9 @@ namespace MoonsecBot
         {
             _client = new DiscordSocketClient(new DiscordSocketConfig
             {
-                GatewayIntents = GatewayIntents.Guilds | GatewayIntents.GuildMessages,
-                AlwaysDownloadUsers = true
+                // Added MessageContent intent if you plan to use prefixes later, 
+                // but keep it standard for Slash Commands.
+                GatewayIntents = GatewayIntents.Guilds | GatewayIntents.GuildMessages
             });
 
             _interactions = new InteractionService(_client.Rest);
@@ -54,14 +54,12 @@ namespace MoonsecBot
 
         private static async Task StartHealthCheckServer()
         {
+            var portStr = Environment.GetEnvironmentVariable("PORT") ?? "8080";
             var builder = WebApplication.CreateBuilder();
-            // Listening on 8080 for Render's secondary port/health check
-            builder.WebHost.UseSetting("urls", "http://0.0.0.0:8080");
+            builder.WebHost.UseSetting("urls", $"http://0.0.0.0:{portStr}");
             
             var app = builder.Build();
-            app.MapGet("/bot", () => "Bot logic is active on 8080");
-            app.MapGet("/", () => "Service is running");
-            
+            app.MapGet("/bot", () => "Active"); // Keep Render alive
             await app.RunAsync();
         }
 
@@ -69,7 +67,6 @@ namespace MoonsecBot
         {
             await _interactions.AddModulesAsync(Assembly.GetEntryAssembly(), _services);
             await _interactions.RegisterCommandsGloballyAsync(true);
-            Console.WriteLine($"✅ Connected as {_client.CurrentUser}");
         }
 
         private async Task HandleInteractionAsync(SocketInteraction interaction)
@@ -85,14 +82,16 @@ namespace MoonsecBot
 
         public DeobfuscationModule(DeobfuscationService service) => _service = service;
 
-        [SlashCommand("deobfuscate", "Decompile a MoonSec file (Pipeline: File -> .bin -> API)")]
-        public async Task Deobfuscate([Summary("file", "Upload .lua or .txt")] Attachment file)
+        [SlashCommand("deobfuscate", "Upload .lua/.txt to decompile via MoonSec Pipeline")]
+        public async Task Deobfuscate([Summary("file", "The obfuscated .lua or .txt file")] Attachment file)
         {
             await DeferAsync();
 
-            if (!file.Filename.EndsWith(".lua") && !file.Filename.EndsWith(".txt"))
+            // Accept only .lua and .txt files
+            string ext = Path.GetExtension(file.Filename).ToLower();
+            if (ext != ".lua" && ext != ".txt")
             {
-                await FollowupAsync("❌ Only `.lua` or `.txt` files are allowed.");
+                await FollowupAsync("❌ Invalid file type. Please upload a `.lua` or `.txt` file.");
                 return;
             }
 
@@ -100,19 +99,17 @@ namespace MoonsecBot
             {
                 using var http = new HttpClient();
                 var bytes = await http.GetByteArrayAsync(file.Url);
-                var inputSource = Encoding.UTF8.GetString(bytes);
+                var sourceCode = Encoding.UTF8.GetString(bytes);
 
-                // 1. Devirtualize to Bytecode (.bin)
-                // 2. POST to API for Decompilation
-                var decompiledCode = await _service.FullDecompilePipelineAsync(inputSource);
+                // 1. Process to .bin (Devirtualize)
+                // 2. Send to API and get string result
+                var decompiledResult = await _service.GetDecompiledSourceAsync(sourceCode);
 
-                // Generate random hex name
+                // 3. Generate random hex filename
                 string hexName = Guid.NewGuid().ToString("N").Substring(0, 12) + ".lua";
 
-                using var ms = new MemoryStream(Encoding.UTF8.GetBytes(decompiledCode));
-                await Context.Channel.SendFileAsync(ms, hexName, "✅ **Decompilation Successful**");
-                
-                // Cleanup the "Bot is thinking" message
+                using var ms = new MemoryStream(Encoding.UTF8.GetBytes(decompiledResult));
+                await Context.Channel.SendFileAsync(ms, hexName, "✅ **Decompilation Successful:**");
                 await DeleteOriginalResponseAsync();
             }
             catch (Exception ex)
@@ -125,12 +122,12 @@ namespace MoonsecBot
     public class DeobfuscationService
     {
         private static readonly HttpClient _apiClient = new HttpClient();
-        // Points to the Medal Decompiler running on port 3000
-        private const string ApiUrl = "http://127.0.0.1:3000/lua51/decompile";
+        // Replace with your actual Render API URL
+        private const string ApiUrl = "https://medal-1.onrender.com/lua51/decompile";
 
-        public async Task<string> FullDecompilePipelineAsync(string code)
+        public async Task<string> GetDecompiledSourceAsync(string code)
         {
-            // STEP 1: Devirtualize to Bytecode (.bin)
+            // Step 1: Devirtualize into bytecode (.bin format)
             var deobfuscator = new Deobfuscator();
             var result = deobfuscator.Deobfuscate(code);
             
@@ -144,16 +141,16 @@ namespace MoonsecBot
                 bytecode = ms.ToArray();
             }
 
-            // STEP 2: Send .bin to Decompiler API
+            // Step 2: Send .bin data to the API via POST
             using var content = new ByteArrayContent(bytecode);
             var response = await _apiClient.PostAsync(ApiUrl, content);
 
             if (!response.IsSuccessStatusCode)
             {
-                throw new Exception($"Decompiler API error: {response.StatusCode}");
+                throw new Exception($"API returned {response.StatusCode}");
             }
 
-            // STEP 3: Return the final decompiled text
+            // Return the decompiled string
             return await response.Content.ReadAsStringAsync();
         }
     }
