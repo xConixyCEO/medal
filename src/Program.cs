@@ -8,6 +8,8 @@ using System.Net;
 using Microsoft.AspNetCore.Builder;
 using MoonsecDeobfuscator.Deobfuscation;
 using MoonsecDeobfuscator.Deobfuscation.Bytecode;
+using Polly;
+using Polly.Retry;
 
 namespace MoonsecBot
 {
@@ -19,97 +21,76 @@ namespace MoonsecBot
 
         public static async Task Main(string[] args)
         {
-            DotNetEnv.Env.Load();
             _ = StartHealthCheckServer();
             await new Program().RunAsync();
+        }
+
+        private static async Task StartHealthCheckServer()
+        {
+            var builder = WebApplication.CreateBuilder();
+            builder.WebHost.UseSetting("urls", "http://0.0.0.0:8080");
+            var app = builder.Build();
+            app.MapGet("/bot", () => "Bot is Healthy");
+            await app.RunAsync();
         }
 
         public async Task RunAsync()
         {
             _client = new DiscordSocketClient(new DiscordSocketConfig
             {
-                // Added MessageContent intent if you plan to use prefixes later, 
-                // but keep it standard for Slash Commands.
                 GatewayIntents = GatewayIntents.Guilds | GatewayIntents.GuildMessages
             });
 
             _interactions = new InteractionService(_client.Rest);
-
             _services = new ServiceCollection()
                 .AddSingleton(_client)
                 .AddSingleton(_interactions)
                 .AddSingleton<DeobfuscationService>()
                 .BuildServiceProvider();
 
-            _client.Log += msg => { Console.WriteLine(msg); return Task.CompletedTask; };
-            _client.Ready += ReadyAsync;
-            _client.InteractionCreated += HandleInteractionAsync;
+            _client.Ready += async () => 
+            {
+                await _interactions.AddModulesAsync(Assembly.GetEntryAssembly(), _services);
+                await _interactions.RegisterCommandsGloballyAsync(true);
+            };
 
-            var token = Environment.GetEnvironmentVariable("DISCORD_BOT_TOKEN");
-            await _client.LoginAsync(TokenType.Bot, token);
+            _client.InteractionCreated += async (x) => 
+            {
+                var ctx = new SocketInteractionContext(_client, x);
+                await _interactions.ExecuteCommandAsync(ctx, _services);
+            };
+
+            await _client.LoginAsync(TokenType.Bot, Environment.GetEnvironmentVariable("DISCORD_BOT_TOKEN"));
             await _client.StartAsync();
-
             await Task.Delay(-1);
-        }
-
-        private static async Task StartHealthCheckServer()
-        {
-            var portStr = Environment.GetEnvironmentVariable("PORT") ?? "8080";
-            var builder = WebApplication.CreateBuilder();
-            builder.WebHost.UseSetting("urls", $"http://0.0.0.0:{portStr}");
-            
-            var app = builder.Build();
-            app.MapGet("/bot", () => "Active"); // Keep Render alive
-            await app.RunAsync();
-        }
-
-        private async Task ReadyAsync()
-        {
-            await _interactions.AddModulesAsync(Assembly.GetEntryAssembly(), _services);
-            await _interactions.RegisterCommandsGloballyAsync(true);
-        }
-
-        private async Task HandleInteractionAsync(SocketInteraction interaction)
-        {
-            var context = new SocketInteractionContext(_client, interaction);
-            await _interactions.ExecuteCommandAsync(context, _services);
         }
     }
 
     public class DeobfuscationModule : InteractionModuleBase<SocketInteractionContext>
     {
         private readonly DeobfuscationService _service;
-
         public DeobfuscationModule(DeobfuscationService service) => _service = service;
 
-        [SlashCommand("deobfuscate", "Upload .lua/.txt to decompile via MoonSec Pipeline")]
-        public async Task Deobfuscate([Summary("file", "The obfuscated .lua or .txt file")] Attachment file)
+        [SlashCommand("deobfuscate", "Process MoonSec file through Luau pipeline")]
+        public async Task Deobfuscate(Attachment file)
         {
             await DeferAsync();
-
-            // Accept only .lua and .txt files
-            string ext = Path.GetExtension(file.Filename).ToLower();
-            if (ext != ".lua" && ext != ".txt")
-            {
-                await FollowupAsync("❌ Invalid file type. Please upload a `.lua` or `.txt` file.");
-                return;
-            }
+            
+            // Starts the "Bot is typing..." status in Discord
+            using var typing = Context.Channel.EnterTypingState();
 
             try
             {
                 using var http = new HttpClient();
                 var bytes = await http.GetByteArrayAsync(file.Url);
-                var sourceCode = Encoding.UTF8.GetString(bytes);
+                var source = Encoding.UTF8.GetString(bytes);
 
-                // 1. Process to .bin (Devirtualize)
-                // 2. Send to API and get string result
-                var decompiledResult = await _service.GetDecompiledSourceAsync(sourceCode);
+                var decompiledResult = await _service.ProcessLuauPipelineWithRetryAsync(source);
 
-                // 3. Generate random hex filename
                 string hexName = Guid.NewGuid().ToString("N").Substring(0, 12) + ".lua";
-
                 using var ms = new MemoryStream(Encoding.UTF8.GetBytes(decompiledResult));
-                await Context.Channel.SendFileAsync(ms, hexName, "✅ **Decompilation Successful:**");
+                
+                await Context.Channel.SendFileAsync(ms, hexName, "✅ **Luau Decompilation Complete**");
                 await DeleteOriginalResponseAsync();
             }
             catch (Exception ex)
@@ -122,12 +103,26 @@ namespace MoonsecBot
     public class DeobfuscationService
     {
         private static readonly HttpClient _apiClient = new HttpClient();
-        // Replace with your actual Render API URL
-        private const string ApiUrl = "https://medal-1.onrender.com/luau/decompile";
+        private const string LuauEndpoint = "http://127.0.0.1:3000/luau/decompile";
+        
+        // Policy: Retry 3 times with a 2s, 4s, and 8s delay
+        private readonly AsyncRetryPolicy<HttpResponseMessage> _retryPolicy;
 
-        public async Task<string> GetDecompiledSourceAsync(string code)
+        public DeobfuscationService()
         {
-            // Step 1: Devirtualize into bytecode (.bin format)
+            _retryPolicy = Policy
+                .HandleResult<HttpResponseMessage>(r => !r.IsSuccessStatusCode)
+                .Or<HttpRequestException>()
+                .WaitAndRetryAsync(3, retryAttempt => 
+                    TimeSpan.FromSeconds(Math.Pow(2, retryAttempt)), 
+                    (outcome, timespan, retryCount, context) =>
+                    {
+                        Console.WriteLine($"[Retry] Attempt {retryCount} failed. Retrying in {timespan.TotalSeconds}s...");
+                    });
+        }
+
+        public async Task<string> ProcessLuauPipelineWithRetryAsync(string code)
+        {
             var deobfuscator = new Deobfuscator();
             var result = deobfuscator.Deobfuscate(code);
             
@@ -141,18 +136,17 @@ namespace MoonsecBot
                 bytecode = ms.ToArray();
             }
 
-            // Step 2: Send .bin data to the API via POST
-            using var content = new ByteArrayContent(bytecode);
-            var response = await _apiClient.PostAsync(ApiUrl, content);
+            // Execute the POST request within the retry policy
+            var response = await _retryPolicy.ExecuteAsync(async () => 
+            {
+                using var content = new ByteArrayContent(bytecode);
+                return await _apiClient.PostAsync(LuauEndpoint, content);
+            });
 
             if (!response.IsSuccessStatusCode)
-            {
-                throw new Exception($"API returned {response.StatusCode}");
-            }
+                throw new Exception($"API failed after 3 retries ({response.StatusCode})");
 
-            // Return the decompiled string
             return await response.Content.ReadAsStringAsync();
         }
     }
 }
-
