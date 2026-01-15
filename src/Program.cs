@@ -21,6 +21,7 @@ namespace MoonsecBot
 
         public static async Task Main(string[] args)
         {
+            // Start Health Check on 8080 for Render
             _ = StartHealthCheckServer();
             await new Program().RunAsync();
         }
@@ -52,7 +53,7 @@ namespace MoonsecBot
             {
                 await _interactions.AddModulesAsync(Assembly.GetEntryAssembly(), _services);
                 await _interactions.RegisterCommandsGloballyAsync(true);
-                Console.WriteLine("✅ Slash Commands Registered");
+                Console.WriteLine("✅ Slash Commands Registered and Ready.");
             };
 
             _client.InteractionCreated += async (x) => 
@@ -61,7 +62,8 @@ namespace MoonsecBot
                 await _interactions.ExecuteCommandAsync(ctx, _services);
             };
 
-            await _client.LoginAsync(TokenType.Bot, Environment.GetEnvironmentVariable("DISCORD_BOT_TOKEN"));
+            var token = Environment.GetEnvironmentVariable("DISCORD_BOT_TOKEN");
+            await _client.LoginAsync(TokenType.Bot, token);
             await _client.StartAsync();
             await Task.Delay(-1);
         }
@@ -76,6 +78,7 @@ namespace MoonsecBot
         public async Task Deobfuscate(Attachment file)
         {
             await DeferAsync();
+            // Shows "Bot is typing..." in Discord during the process
             using var typing = Context.Channel.EnterTypingState();
 
             try
@@ -90,7 +93,7 @@ namespace MoonsecBot
                 string hexName = Guid.NewGuid().ToString("N").Substring(0, 12) + ".lua";
                 using var ms = new MemoryStream(Encoding.UTF8.GetBytes(decompiledResult));
                 
-                await Context.Channel.SendFileAsync(ms, hexName, "✅ **Shiny Luau Decompilation Complete**");
+                await Context.Channel.SendFileAsync(ms, hexName, "✅ **Luau Decompilation Complete**");
                 await DeleteOriginalResponseAsync();
             }
             catch (Exception ex)
@@ -108,19 +111,23 @@ namespace MoonsecBot
 
         public DeobfuscationService()
         {
+            // Retry 3 times with exponential backoff (2s, 4s, 8s)
             _retryPolicy = Policy
                 .HandleResult<HttpResponseMessage>(r => !r.IsSuccessStatusCode)
                 .Or<HttpRequestException>()
-                .WaitAndRetryAsync(3, i => TimeSpan.FromSeconds(Math.Pow(2, i)));
+                .WaitAndRetryAsync(3, i => TimeSpan.FromSeconds(Math.Pow(2, i)), 
+                (outcome, timespan, retryCount, context) => {
+                    Console.WriteLine($"[Retry] Attempt {retryCount} failed. Retrying...");
+                });
         }
 
         public async Task<string> ProcessLuauPipelineWithRetryAsync(string code)
         {
-            // 1. Devirtualize
+            // 1. Devirtualize MoonSec
             var deobfuscator = new Deobfuscator();
             var result = deobfuscator.Deobfuscate(code);
             
-            // 2. Serialize to .bin
+            // 2. Serialize to .bin Bytecode
             byte[] bytecode;
             using (var ms = new MemoryStream())
             {
@@ -131,19 +138,21 @@ namespace MoonsecBot
                 bytecode = ms.ToArray();
             }
 
-            // 3. BASE64 ENCODE (Crucial fix based on Shiny README)
-            string base64Bytecode = Convert.ToBase64String(bytecode);
+            // 3. Base64 Encode (matches Shiny's Rust BASE64_STANDARD.decode check)
+            string base64Data = Convert.ToBase64String(bytecode);
 
-            // 4. POST to Local Shiny API
+            // 4. POST to internal Shiny service
             var response = await _retryPolicy.ExecuteAsync(async () => 
             {
-                // Shiny expects the body to be the Base64 string
-                using var content = new StringContent(base64Bytecode, Encoding.UTF8, "text/plain");
+                using var content = new StringContent(base64Data, Encoding.UTF8, "text/plain");
                 return await _apiClient.PostAsync(LuauEndpoint, content);
             });
 
             if (!response.IsSuccessStatusCode)
-                throw new Exception($"Shiny API error: {response.StatusCode}");
+            {
+                string err = await response.Content.ReadAsStringAsync();
+                throw new Exception($"Shiny API error {response.StatusCode}: {err}");
+            }
 
             return await response.Content.ReadAsStringAsync();
         }
