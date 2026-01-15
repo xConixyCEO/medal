@@ -123,7 +123,7 @@ namespace MoonsecBot
     {
         private static readonly HttpClient _apiClient = new HttpClient();
         // Replace with your actual Render API URL
-        private const string ApiUrl = "https://medal-1.onrender.com/lua51/decompile";
+        private const string ApiUrl = "https://medal-1.onrender.com/luau/decompile";
 
         public async Task<string> GetDecompiledSourceAsync(string code)
         {
@@ -155,3 +155,4 @@ namespace MoonsecBot
         }
     }
 }
+
