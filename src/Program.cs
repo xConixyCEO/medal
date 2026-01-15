@@ -21,7 +21,7 @@ namespace MoonsecBot
 
         public static async Task Main(string[] args)
         {
-            // Start Health Check on 8080 for Render
+            // Start Health Check on the custom PORT1
             _ = StartHealthCheckServer();
             await new Program().RunAsync();
         }
@@ -29,9 +29,12 @@ namespace MoonsecBot
         private static async Task StartHealthCheckServer()
         {
             var builder = WebApplication.CreateBuilder();
-            builder.WebHost.UseSetting("urls", "http://0.0.0.0:8080");
+            // Specifically looking for the "PORT1" variable you requested
+            var port1 = Environment.GetEnvironmentVariable("PORT1") ?? "8080";
+            builder.WebHost.UseSetting("urls", $"http://0.0.0.0:{port1}");
+            
             var app = builder.Build();
-            app.MapGet("/bot", () => "Shiny Bot is Online");
+            app.MapGet("/bot", () => $"Bot Healthy on custom PORT1: {port1}");
             await app.RunAsync();
         }
 
@@ -53,7 +56,6 @@ namespace MoonsecBot
             {
                 await _interactions.AddModulesAsync(Assembly.GetEntryAssembly(), _services);
                 await _interactions.RegisterCommandsGloballyAsync(true);
-                Console.WriteLine("✅ Slash Commands Registered and Ready.");
             };
 
             _client.InteractionCreated += async (x) => 
@@ -62,8 +64,7 @@ namespace MoonsecBot
                 await _interactions.ExecuteCommandAsync(ctx, _services);
             };
 
-            var token = Environment.GetEnvironmentVariable("DISCORD_BOT_TOKEN");
-            await _client.LoginAsync(TokenType.Bot, token);
+            await _client.LoginAsync(TokenType.Bot, Environment.GetEnvironmentVariable("DISCORD_BOT_TOKEN"));
             await _client.StartAsync();
             await Task.Delay(-1);
         }
@@ -75,10 +76,9 @@ namespace MoonsecBot
         public DeobfuscationModule(DeobfuscationService service) => _service = service;
 
         [SlashCommand("deobfuscate", "Decompile MoonSec file via Shiny Luau")]
-        public async Task Deobfuscate(Attachment file)
+        public async Task Deobfuscate([Summary("file", "The .lua or .txt file")] Attachment file)
         {
             await DeferAsync();
-            // Shows "Bot is typing..." in Discord during the process
             using var typing = Context.Channel.EnterTypingState();
 
             try
@@ -87,11 +87,10 @@ namespace MoonsecBot
                 var bytes = await http.GetByteArrayAsync(file.Url);
                 var source = Encoding.UTF8.GetString(bytes);
 
-                // Pipeline: Devirtualize -> .bin -> Base64 -> Shiny API
-                var decompiledResult = await _service.ProcessLuauPipelineWithRetryAsync(source);
+                var result = await _service.ProcessPipelineAsync(source);
 
                 string hexName = Guid.NewGuid().ToString("N").Substring(0, 12) + ".lua";
-                using var ms = new MemoryStream(Encoding.UTF8.GetBytes(decompiledResult));
+                using var ms = new MemoryStream(Encoding.UTF8.GetBytes(result));
                 
                 await Context.Channel.SendFileAsync(ms, hexName, "✅ **Luau Decompilation Complete**");
                 await DeleteOriginalResponseAsync();
@@ -111,49 +110,33 @@ namespace MoonsecBot
 
         public DeobfuscationService()
         {
-            // Retry 3 times with exponential backoff (2s, 4s, 8s)
             _retryPolicy = Policy
                 .HandleResult<HttpResponseMessage>(r => !r.IsSuccessStatusCode)
                 .Or<HttpRequestException>()
-                .WaitAndRetryAsync(3, i => TimeSpan.FromSeconds(Math.Pow(2, i)), 
-                (outcome, timespan, retryCount, context) => {
-                    Console.WriteLine($"[Retry] Attempt {retryCount} failed. Retrying...");
-                });
+                .WaitAndRetryAsync(3, i => TimeSpan.FromSeconds(Math.Pow(2, i)));
         }
 
-        public async Task<string> ProcessLuauPipelineWithRetryAsync(string code)
+        public async Task<string> ProcessPipelineAsync(string code)
         {
-            // 1. Devirtualize MoonSec
             var deobfuscator = new Deobfuscator();
-            var result = deobfuscator.Deobfuscate(code);
+            var res = deobfuscator.Deobfuscate(code);
             
-            // 2. Serialize to .bin Bytecode
-            byte[] bytecode;
+            byte[] bin;
             using (var ms = new MemoryStream())
             {
-                using (var serializer = new Serializer(ms))
-                {
-                    serializer.Serialize(result);
-                }
-                bytecode = ms.ToArray();
+                using (var ser = new Serializer(ms)) ser.Serialize(res);
+                bin = ms.ToArray();
             }
 
-            // 3. Base64 Encode (matches Shiny's Rust BASE64_STANDARD.decode check)
-            string base64Data = Convert.ToBase64String(bytecode);
+            // Convert to Base64 (Required by Shiny's decompile_no_io logic)
+            string b64 = Convert.ToBase64String(bin);
 
-            // 4. POST to internal Shiny service
             var response = await _retryPolicy.ExecuteAsync(async () => 
             {
-                using var content = new StringContent(base64Data, Encoding.UTF8, "text/plain");
-                return await _apiClient.PostAsync(LuauEndpoint, content);
+                return await _apiClient.PostAsync(LuauEndpoint, new StringContent(b64, Encoding.UTF8, "text/plain"));
             });
 
-            if (!response.IsSuccessStatusCode)
-            {
-                string err = await response.Content.ReadAsStringAsync();
-                throw new Exception($"Shiny API error {response.StatusCode}: {err}");
-            }
-
+            if (!response.IsSuccessStatusCode) throw new Exception($"Shiny API error: {response.StatusCode}");
             return await response.Content.ReadAsStringAsync();
         }
     }
