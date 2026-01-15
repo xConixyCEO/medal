@@ -30,7 +30,7 @@ namespace MoonsecBot
             var builder = WebApplication.CreateBuilder();
             builder.WebHost.UseSetting("urls", "http://0.0.0.0:8080");
             var app = builder.Build();
-            app.MapGet("/bot", () => "Bot is Healthy");
+            app.MapGet("/bot", () => "Shiny Bot is Online");
             await app.RunAsync();
         }
 
@@ -52,6 +52,7 @@ namespace MoonsecBot
             {
                 await _interactions.AddModulesAsync(Assembly.GetEntryAssembly(), _services);
                 await _interactions.RegisterCommandsGloballyAsync(true);
+                Console.WriteLine("✅ Slash Commands Registered");
             };
 
             _client.InteractionCreated += async (x) => 
@@ -71,12 +72,10 @@ namespace MoonsecBot
         private readonly DeobfuscationService _service;
         public DeobfuscationModule(DeobfuscationService service) => _service = service;
 
-        [SlashCommand("deobfuscate", "Process MoonSec file through Luau pipeline")]
+        [SlashCommand("deobfuscate", "Decompile MoonSec file via Shiny Luau")]
         public async Task Deobfuscate(Attachment file)
         {
             await DeferAsync();
-            
-            // Starts the "Bot is typing..." status in Discord
             using var typing = Context.Channel.EnterTypingState();
 
             try
@@ -85,17 +84,18 @@ namespace MoonsecBot
                 var bytes = await http.GetByteArrayAsync(file.Url);
                 var source = Encoding.UTF8.GetString(bytes);
 
+                // Pipeline: Devirtualize -> .bin -> Base64 -> Shiny API
                 var decompiledResult = await _service.ProcessLuauPipelineWithRetryAsync(source);
 
                 string hexName = Guid.NewGuid().ToString("N").Substring(0, 12) + ".lua";
                 using var ms = new MemoryStream(Encoding.UTF8.GetBytes(decompiledResult));
                 
-                await Context.Channel.SendFileAsync(ms, hexName, "✅ **Luau Decompilation Complete**");
+                await Context.Channel.SendFileAsync(ms, hexName, "✅ **Shiny Luau Decompilation Complete**");
                 await DeleteOriginalResponseAsync();
             }
             catch (Exception ex)
             {
-                await FollowupAsync($"❌ Error: `{ex.Message}`");
+                await FollowupAsync($"❌ **Error:** `{ex.Message}`");
             }
         }
     }
@@ -104,8 +104,6 @@ namespace MoonsecBot
     {
         private static readonly HttpClient _apiClient = new HttpClient();
         private const string LuauEndpoint = "http://127.0.0.1:3000/luau/decompile";
-        
-        // Policy: Retry 3 times with a 2s, 4s, and 8s delay
         private readonly AsyncRetryPolicy<HttpResponseMessage> _retryPolicy;
 
         public DeobfuscationService()
@@ -113,19 +111,16 @@ namespace MoonsecBot
             _retryPolicy = Policy
                 .HandleResult<HttpResponseMessage>(r => !r.IsSuccessStatusCode)
                 .Or<HttpRequestException>()
-                .WaitAndRetryAsync(3, retryAttempt => 
-                    TimeSpan.FromSeconds(Math.Pow(2, retryAttempt)), 
-                    (outcome, timespan, retryCount, context) =>
-                    {
-                        Console.WriteLine($"[Retry] Attempt {retryCount} failed. Retrying in {timespan.TotalSeconds}s...");
-                    });
+                .WaitAndRetryAsync(3, i => TimeSpan.FromSeconds(Math.Pow(2, i)));
         }
 
         public async Task<string> ProcessLuauPipelineWithRetryAsync(string code)
         {
+            // 1. Devirtualize
             var deobfuscator = new Deobfuscator();
             var result = deobfuscator.Deobfuscate(code);
             
+            // 2. Serialize to .bin
             byte[] bytecode;
             using (var ms = new MemoryStream())
             {
@@ -136,15 +131,19 @@ namespace MoonsecBot
                 bytecode = ms.ToArray();
             }
 
-            // Execute the POST request within the retry policy
+            // 3. BASE64 ENCODE (Crucial fix based on Shiny README)
+            string base64Bytecode = Convert.ToBase64String(bytecode);
+
+            // 4. POST to Local Shiny API
             var response = await _retryPolicy.ExecuteAsync(async () => 
             {
-                using var content = new ByteArrayContent(bytecode);
+                // Shiny expects the body to be the Base64 string
+                using var content = new StringContent(base64Bytecode, Encoding.UTF8, "text/plain");
                 return await _apiClient.PostAsync(LuauEndpoint, content);
             });
 
             if (!response.IsSuccessStatusCode)
-                throw new Exception($"API failed after 3 retries ({response.StatusCode})");
+                throw new Exception($"Shiny API error: {response.StatusCode}");
 
             return await response.Content.ReadAsStringAsync();
         }
